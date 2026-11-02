@@ -163,6 +163,8 @@ if TYPE_CHECKING:
     VLLM_ROCM_MOE_PADDING: bool = True
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
     VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
+    VLLM_KV_EVICTION_POLICY: str = "lru"
+    VLLM_KV_SHARED_HITS: int = 4
     VLLM_LOG_BATCHSIZE_INTERVAL: float = -1
     VLLM_DISABLE_COMPILE_CACHE: bool = False
     VLLM_REPLICATE_EMBED: bool = False
@@ -1463,6 +1465,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ENABLE_V1_MULTIPROCESSING": lambda: bool(
         int(os.getenv("VLLM_ENABLE_V1_MULTIPROCESSING", "1"))
     ),
+    # KV block eviction order: "lru" (default) or "agent", which keeps blocks hit at least
+    # VLLM_KV_SHARED_HITS times (shared system prompt, tool schema) until nothing else is free.
+    "VLLM_KV_EVICTION_POLICY": lambda: os.getenv("VLLM_KV_EVICTION_POLICY", "lru"),
+    "VLLM_KV_SHARED_HITS": lambda: int(os.getenv("VLLM_KV_SHARED_HITS", "4")),
     "VLLM_LOG_BATCHSIZE_INTERVAL": lambda: float(
         os.getenv("VLLM_LOG_BATCHSIZE_INTERVAL", "-1")
     ),

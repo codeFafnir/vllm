@@ -3,6 +3,7 @@
 from collections.abc import Callable, Iterable, Sequence
 from typing import Any
 
+from vllm import envs
 from vllm.distributed.kv_events import (
     MEDIUM_GPU,
     AllBlocksCleared,
@@ -176,6 +177,11 @@ class BlockPool:
         # list of free blocks (including eviction candidates when caching is
         # enabled).
         self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
+        # Agent eviction policy: blocks shared across sessions wait here and are
+        # only reused once free_block_queue is empty.
+        self.protected_queue = FreeKVCacheBlockQueue([])
+        self.agent_eviction = envs.VLLM_KV_EVICTION_POLICY == "agent"
+        self.shared_hits = envs.VLLM_KV_SHARED_HITS
 
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
@@ -678,7 +684,11 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
-        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+        from_normal = min(num_blocks, self.free_block_queue.num_free_blocks)
+        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(from_normal)
+        ret += self.protected_queue.popleft_n(num_blocks - from_normal)
+        for block in ret:
+            block.protected = False
 
         if self._reuse_watchers:
             self._notify_reuse(ret)
@@ -762,8 +772,11 @@ class BlockPool:
             # ref_cnt=0 means this block is in the free list (i.e. eviction
             # candidate), so remove it.
             if block.ref_cnt == 0 and not block.is_null:
-                self.free_block_queue.remove(block)
+                queue = self.protected_queue if block.protected else self.free_block_queue
+                queue.remove(block)
+                block.protected = False
             block.ref_cnt += 1
+            block.hit_count += 1
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
 
@@ -783,6 +796,7 @@ class BlockPool:
         # Identify blocks with hash (LRU cache) and without it (never match APC)
         blocks_to_evict_last = []
         blocks_to_evict_first = []
+        blocks_to_protect = []
         other_pools: dict[BlockPool, list[KVCacheBlock]] = {}
         for block in ordered_blocks:
             if block.pool is not None and block.pool is not self:
@@ -793,6 +807,9 @@ class BlockPool:
                 if block.block_hash is None or not self.enable_caching:
                     # LIFO reuse of non-cached blocks for better GPU locality.
                     blocks_to_evict_first.append(block)
+                elif self.agent_eviction and block.hit_count >= self.shared_hits:
+                    block.protected = True
+                    blocks_to_protect.append(block)
                 else:
                     # FIFO reuse of cached blocks for LRU eviction behavior.
                     blocks_to_evict_last.append(block)
@@ -801,6 +818,7 @@ class BlockPool:
         self.free_block_queue.prepend_n(blocks_to_evict_first)
         # Blocks to reuse last are appended to the end of the free queue.
         self.free_block_queue.append_n(blocks_to_evict_last)
+        self.protected_queue.append_n(blocks_to_protect)
         for pool, blocks in other_pools.items():
             pool.free_blocks(blocks)
 
@@ -872,7 +890,9 @@ class BlockPool:
             The number of free blocks.
 
         """
-        return self.free_block_queue.num_free_blocks
+        return (
+            self.free_block_queue.num_free_blocks + self.protected_queue.num_free_blocks
+        )
 
     def get_usage(self) -> float:
         """Get the KV cache usage.
