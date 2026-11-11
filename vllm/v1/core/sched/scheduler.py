@@ -48,6 +48,7 @@ from vllm.v1.core.sched.output import (
     SchedulerOutput,
 )
 from vllm.v1.core.sched.request_queue import (
+    ContinuumRequestQueue,
     RequestQueue,
     SchedulingPolicy,
     create_request_queue,
@@ -229,6 +230,16 @@ class Scheduler(SchedulerInterface):
         # scan or enqueued in a blocked status.
         self.deferred_waiting: set[Request] = set()
         self.running: list[Request] = []
+
+        # Continuum: pin finished agent turns' KV for continuum_ttl_s.
+        self.continuum_ttl_s = float(self.scheduler_config.continuum_ttl_s)
+        # session_id -> (finished request holding KV, pin deadline monotonic)
+        self.pinned: dict[str, tuple[Request, float]] = {}
+        self._program_first_entry: dict[str, float] = {}
+        self._continuum_pins = 0
+        self._continuum_unpins_ttl = 0
+        self._continuum_unpins_next_turn = 0
+        self._continuum_unpins_pressure = 0
 
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
@@ -588,6 +599,93 @@ class Scheduler(SchedulerInterface):
             num_new_tokens -= self.num_prefill_lookahead - remaining
         return max(num_new_tokens, 0)
 
+    @staticmethod
+    def _continuum_program_key(request: Request) -> str | None:
+        return request.session_id
+
+    def _continuum_waiting_sessions(self) -> set[str]:
+        sessions: set[str] = set()
+        for queue in (self.waiting, self.kv_holding_waiting):
+            for request in queue:
+                if request.session_id is not None:
+                    sessions.add(request.session_id)
+        return sessions
+
+    def _continuum_record_program(self, request: Request) -> None:
+        session = request.session_id
+        if session is None:
+            return
+        prev = self._program_first_entry.get(session)
+        if prev is None or request.arrival_time < prev:
+            self._program_first_entry[session] = request.arrival_time
+
+    def _continuum_set_queue_pins(self) -> None:
+        pinned = set(self.pinned)
+        for queue in (self.waiting, self.kv_holding_waiting):
+            if isinstance(queue, ContinuumRequestQueue):
+                queue.set_pinned(pinned)
+
+    def _pin(self, request: Request) -> None:
+        session = request.session_id
+        assert session is not None
+        deadline = time.monotonic() + self.continuum_ttl_s
+        self.pinned[session] = (request, deadline)
+        self._continuum_pins += 1
+
+    def _unpin(self, session: str, reason: str) -> None:
+        entry = self.pinned.pop(session, None)
+        if entry is None:
+            return
+        request, _deadline = entry
+        self._free_request_blocks(request)
+        if reason == "ttl":
+            self._continuum_unpins_ttl += 1
+        elif reason == "next_turn":
+            self._continuum_unpins_next_turn += 1
+        elif reason == "pressure":
+            self._continuum_unpins_pressure += 1
+
+    def _sweep_pins(self, now: float) -> None:
+        if not self.pinned:
+            return
+        waiting = self._continuum_waiting_sessions()
+        expired = [
+            session
+            for session, (_request, deadline) in self.pinned.items()
+            if now >= deadline and session not in waiting
+        ]
+        for session in expired:
+            self._unpin(session, "ttl")
+
+    def _unpin_all(self, reason: str) -> None:
+        for session in list(self.pinned):
+            self._unpin(session, reason)
+
+    def _continuum_try_unpin_for_pressure(self) -> bool:
+        """Drop the newest pin under memory pressure. Returns True if one dropped."""
+        if not self.pinned:
+            return False
+        session, (_request, deadline) = max(
+            self.pinned.items(), key=lambda item: item[1][1]
+        )
+        del deadline
+        self._unpin(session, "pressure")
+        return True
+
+    def _continuum_pick_preempt_victim(self) -> Request:
+        """Preempt the running request whose program arrived last."""
+        assert self.running
+        non_final = [r for r in self.running if not r.is_last_step]
+        candidates = non_final or list(self.running)
+
+        def program_entry(request: Request) -> float:
+            session = request.session_id
+            if session is None:
+                return request.arrival_time
+            return self._program_first_entry.get(session, request.arrival_time)
+
+        return max(candidates, key=program_entry)
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -600,6 +698,10 @@ class Scheduler(SchedulerInterface):
         # num_tokens_with_spec. This is general enough to cover
         # chunked prefills, prefix caching, speculative decoding,
         # and the "jump decoding" optimization in the future.
+
+        if self.policy == SchedulingPolicy.CONTINUUM:
+            self._sweep_pins(time.monotonic())
+            self._continuum_set_queue_pins()
 
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
@@ -792,12 +894,21 @@ class Scheduler(SchedulerInterface):
                         break
 
                     # The request cannot be scheduled.
+                    # Continuum: release the newest pin before preempting a runner.
+                    if (
+                        self.policy == SchedulingPolicy.CONTINUUM
+                        and self._continuum_try_unpin_for_pressure()
+                    ):
+                        continue
+
                     # Preempt the lowest-priority request.
                     if self.policy == SchedulingPolicy.PRIORITY:
                         preempted_req = max(
                             self.running,
                             key=lambda r: (r.priority, r.arrival_time),
                         )
+                    elif self.policy == SchedulingPolicy.CONTINUUM:
+                        preempted_req = self._continuum_pick_preempt_victim()
                     else:
                         preempted_req = self.running[-1]
 
@@ -2636,6 +2747,8 @@ class Scheduler(SchedulerInterface):
                 request.spec_decode_metrics = RequestSpecDecodeMetrics.new(
                     self.num_spec_tokens
                 )
+            if self.policy == SchedulingPolicy.CONTINUUM:
+                self._continuum_record_program(request)
             if self.connector is not None:
                 self.connector.on_new_request(request)
                 kv_transfer_params = request.kv_transfer_params
@@ -2738,7 +2851,26 @@ class Scheduler(SchedulerInterface):
             self.finished_req_ids_dict[request.client_index].add(request_id)
 
         delay_free_blocks |= connector_delay_free_blocks
-        if not delay_free_blocks:
+
+        session = request.session_id
+        if session is not None and session in self.pinned:
+            # Next turn of a pinned program: release the previous pin first.
+            self._unpin(session, "next_turn")
+
+        should_pin = (
+            self.policy == SchedulingPolicy.CONTINUUM
+            and session is not None
+            and not request.is_last_step
+            and request.status != RequestStatus.FINISHED_ABORTED
+            and request.status != RequestStatus.FINISHED_ERROR
+            and not delay_free_blocks
+        )
+        if should_pin:
+            self._pin(request)
+            # Drop from the active map; the Request object lives in self.pinned
+            # until TTL / next-turn / pressure releases its blocks.
+            del self.requests[request.request_id]
+        elif not delay_free_blocks:
             self._free_blocks(request)
 
         return kv_xfer_params, ec_xfer_params
@@ -2865,6 +2997,9 @@ class Scheduler(SchedulerInterface):
             # persistent batch in the model runner.
             self.prev_step_scheduled_req_ids.clear()
 
+        # Continuum pins hold live refs; drop them before reset_prefix_cache.
+        self._unpin_all("pressure")
+
         reset_successful = self.kv_cache_manager.reset_prefix_cache()
         if reset_running_requests and not reset_successful:
             raise RuntimeError(
@@ -2956,6 +3091,11 @@ class Scheduler(SchedulerInterface):
             cudagraph_stats=cudagraph_stats,
             perf_stats=perf_stats,
             ec_connector_stats=ec_connector_stats_payload,
+            continuum_pins=self._continuum_pins,
+            continuum_unpins_ttl=self._continuum_unpins_ttl,
+            continuum_unpins_next_turn=self._continuum_unpins_next_turn,
+            continuum_unpins_pressure=self._continuum_unpins_pressure,
+            continuum_pinned_blocks=len(self.pinned),
         )
 
     def make_spec_decoding_stats(
@@ -2979,6 +3119,7 @@ class Scheduler(SchedulerInterface):
 
     def shutdown(self) -> None:
         logger.debug_once("[shutdown] Scheduler: start")
+        self._unpin_all("pressure")
         if self.kv_event_publisher:
             self.kv_event_publisher.shutdown()
         if self.connector is not None:

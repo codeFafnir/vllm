@@ -254,6 +254,13 @@ class SchedulerStats:
 
     perf_stats: PerfStats | None = None
 
+    # Continuum KV pin counters (cumulative within the engine process).
+    continuum_pins: int = 0
+    continuum_unpins_ttl: int = 0
+    continuum_unpins_next_turn: int = 0
+    continuum_unpins_pressure: int = 0
+    continuum_pinned_blocks: int = 0
+
 
 @dataclass
 class RequestStateStats:

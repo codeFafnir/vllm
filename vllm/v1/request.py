@@ -105,6 +105,8 @@ class Request:
         self.kv_transfer_params: dict[str, Any] | None = None
         # E/P/D: Connector-specific encoder-cache transfer parameters.
         self.ec_transfer_params: dict[str, Any] | None = None
+        # Continuum: when True, skip KV pin on finish (final agent turn).
+        self.is_last_step = False
 
         if pooling_params is not None:
             # Pooling models.
@@ -125,6 +127,9 @@ class Request:
                 )
                 self.kv_cache_report_mode = sampling_params.extra_args.get(
                     "kv_cache_report_mode", "incremental"
+                )
+                self.is_last_step = bool(
+                    sampling_params.extra_args.get("is_last_step", False)
                 )
             else:
                 self.kv_cache_report_mode = "incremental"

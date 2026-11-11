@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 RunnerType = Literal["generate", "pooling", "draft"]
-SchedulerPolicy = Literal["fcfs", "priority"]
+SchedulerPolicy = Literal["fcfs", "priority", "continuum"]
 
 
 @config
@@ -162,7 +162,14 @@ class SchedulerConfig:
     - "fcfs" means first come first served, i.e. requests are handled in order 
       of arrival.
     - "priority" means requests are handled based on given priority (lower
-      value means earlier handling) and time of arrival deciding any ties)."""
+      value means earlier handling) and time of arrival deciding any ties).
+    - "continuum" keeps the KV cache of a finished agent turn pinned for
+      `continuum_ttl_s` seconds and orders waiting requests by agent program
+      (`session_id`), pinned programs first."""
+
+    continuum_ttl_s: float = Field(default=2.0, gt=0)
+    """Seconds a finished agent turn's KV cache stays pinned waiting for the
+    next turn of the same session. Only used by the "continuum" policy."""
 
     disable_chunked_mm_input: bool = False
     """If set to true and chunked prefill is enabled, we do not want to

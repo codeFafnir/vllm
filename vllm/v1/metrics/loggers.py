@@ -744,6 +744,39 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             counter_num_preempted_reqs, per_engine_labelvalues
         )
 
+        counter_continuum_pins = self._counter_cls(
+            name="vllm:continuum_pins",
+            documentation="Finished agent turns whose KV was Continuum-pinned.",
+            labelnames=labelnames,
+        )
+        self.counter_continuum_pins = create_metric_per_engine(
+            counter_continuum_pins, per_engine_labelvalues
+        )
+        counter_continuum_unpins = self._counter_cls(
+            name="vllm:continuum_unpins",
+            documentation="Continuum pin releases by reason.",
+            labelnames=labelnames + ["reason"],
+        )
+        self.counter_continuum_unpins: dict[str, dict[int, Counter]] = {
+            reason: {
+                idx: counter_continuum_unpins.labels(model_name, str(idx), reason)
+                for idx in engine_indexes
+            }
+            for reason in ("ttl", "next_turn", "pressure")
+        }
+        gauge_continuum_pinned = self._gauge_cls(
+            name="vllm:continuum_pinned_blocks",
+            documentation="Sessions currently holding a Continuum KV pin.",
+            labelnames=labelnames,
+            multiprocess_mode="sum",
+        )
+        self.gauge_continuum_pinned_blocks = create_metric_per_engine(
+            gauge_continuum_pinned, per_engine_labelvalues
+        )
+        self._continuum_last: dict[int, tuple[int, int, int, int]] = {
+            idx: (0, 0, 0, 0) for idx in engine_indexes
+        }
+
         counter_prompt_tokens = self._counter_cls(
             name="vllm:prompt_tokens",
             documentation="Number of prefill tokens processed.",
@@ -1163,6 +1196,31 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                     scheduler_stats.num_kv_fetch_reqs_by_stage.get(stage, 0)
                 )
             self.gauge_kv_cache_usage[engine_idx].set(scheduler_stats.kv_cache_usage)
+
+            last_pins, last_ttl, last_next, last_pressure = self._continuum_last[
+                engine_idx
+            ]
+            pin_delta = scheduler_stats.continuum_pins - last_pins
+            ttl_delta = scheduler_stats.continuum_unpins_ttl - last_ttl
+            next_delta = scheduler_stats.continuum_unpins_next_turn - last_next
+            pressure_delta = scheduler_stats.continuum_unpins_pressure - last_pressure
+            if pin_delta > 0:
+                self.counter_continuum_pins[engine_idx].inc(pin_delta)
+            if ttl_delta > 0:
+                self.counter_continuum_unpins["ttl"][engine_idx].inc(ttl_delta)
+            if next_delta > 0:
+                self.counter_continuum_unpins["next_turn"][engine_idx].inc(next_delta)
+            if pressure_delta > 0:
+                self.counter_continuum_unpins["pressure"][engine_idx].inc(pressure_delta)
+            self._continuum_last[engine_idx] = (
+                scheduler_stats.continuum_pins,
+                scheduler_stats.continuum_unpins_ttl,
+                scheduler_stats.continuum_unpins_next_turn,
+                scheduler_stats.continuum_unpins_pressure,
+            )
+            self.gauge_continuum_pinned_blocks[engine_idx].set(
+                scheduler_stats.continuum_pinned_blocks
+            )
 
             self.counter_prefix_cache_queries[engine_idx].inc(
                 scheduler_stats.prefix_cache_stats.queries

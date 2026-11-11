@@ -15,6 +15,7 @@ class SchedulingPolicy(Enum):
 
     FCFS = "fcfs"
     PRIORITY = "priority"
+    CONTINUUM = "continuum"
 
 
 class RequestQueue(ABC):
@@ -197,11 +198,104 @@ class PriorityRequestQueue(RequestQueue):
             yield heapq.heappop(heap_copy)
 
 
+class ContinuumRequestQueue(RequestQueue):
+    """Program-level FCFS with pinned sessions preferred.
+
+    A program is identified by ``session_id`` when present, else ``request_id``.
+    The scheduler calls ``set_pinned`` each schedule step with the sessions that
+    currently hold a Continuum KV pin.
+    """
+
+    def __init__(self) -> None:
+        self._queue: deque[Request] = deque()
+        self._first_entry: dict[str, float] = {}
+        self._pinned_sessions: set[str] = set()
+
+    @staticmethod
+    def program_key(request: Request) -> str:
+        if request.session_id is not None:
+            return request.session_id
+        return request.request_id
+
+    def set_pinned(self, sessions: Iterable[str]) -> None:
+        self._pinned_sessions = set(sessions)
+
+    def _record_first_entry(self, request: Request) -> None:
+        key = self.program_key(request)
+        prev = self._first_entry.get(key)
+        if prev is None or request.arrival_time < prev:
+            self._first_entry[key] = request.arrival_time
+
+    def _select(self) -> Request:
+        if not self._queue:
+            raise IndexError("peek from an empty queue")
+        earliest: Request | None = None
+        earliest_time = float("inf")
+        for request in self._queue:
+            key = self.program_key(request)
+            if key not in self._pinned_sessions:
+                continue
+            entry = self._first_entry.get(key, request.arrival_time)
+            if entry < earliest_time:
+                earliest_time = entry
+                earliest = request
+        if earliest is not None:
+            return earliest
+        earliest = None
+        earliest_time = float("inf")
+        for request in self._queue:
+            key = self.program_key(request)
+            entry = self._first_entry.get(key, request.arrival_time)
+            if entry < earliest_time:
+                earliest_time = entry
+                earliest = request
+        assert earliest is not None
+        return earliest
+
+    def add_request(self, request: Request) -> None:
+        self._record_first_entry(request)
+        self._queue.append(request)
+
+    def pop_request(self) -> Request:
+        request = self._select()
+        self._queue.remove(request)
+        return request
+
+    def peek_request(self) -> Request:
+        return self._select()
+
+    def prepend_request(self, request: Request) -> None:
+        self._record_first_entry(request)
+        self._queue.appendleft(request)
+
+    def prepend_requests(self, requests: Iterable[Request]) -> None:
+        for request in requests:
+            self.prepend_request(request)
+
+    def remove_request(self, request: Request) -> None:
+        self._queue.remove(request)
+
+    def remove_requests(self, requests: Iterable[Request]) -> None:
+        to_remove = requests if isinstance(requests, set) else set(requests)
+        self._queue = deque(req for req in self._queue if req not in to_remove)
+
+    def __bool__(self) -> bool:
+        return bool(self._queue)
+
+    def __len__(self) -> int:
+        return len(self._queue)
+
+    def __iter__(self) -> Iterator[Request]:
+        return iter(list(self._queue))
+
+
 def create_request_queue(policy: SchedulingPolicy) -> RequestQueue:
     """Create request queue based on scheduling policy."""
     if policy == SchedulingPolicy.PRIORITY:
         return PriorityRequestQueue()
     elif policy == SchedulingPolicy.FCFS:
         return FCFSRequestQueue()
+    elif policy == SchedulingPolicy.CONTINUUM:
+        return ContinuumRequestQueue()
     else:
         raise ValueError(f"Unknown scheduling policy: {policy}")
